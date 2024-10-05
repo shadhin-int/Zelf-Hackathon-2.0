@@ -1,12 +1,24 @@
+import logging
+from datetime import timedelta
+
+from django.core.paginator import Paginator
+from django.db.models import Sum, F, FloatField, Case, When
+from django.db.models.functions import Cast
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+
 from contents.models import Content, Author, Tag, ContentTag
 from contents.serializers import ContentSerializer, ContentPostSerializer
 
+logger = logging.getLogger(__name__)
+
 
 class ContentAPIView(APIView):
+    DEFAULT_PAGE_SIZE = 10
+    MAX_PAGE_SIZE = 100
 
     def get(self, request):
         """
@@ -41,46 +53,76 @@ class ContentAPIView(APIView):
             - Should have items per page support in query params
             Example: `api_url?items_per_page=10&page=2`
         """
-        query_params = request.query_params.dict()
-        tag = query_params.get('tag', None)
-        if tag:
-            queryset = Content.objects.filter(
-                contenttag__tag__name=tag
-            ).order_by("-id")[:1000]
-        else:
-            queryset = Content.objects.all()
-        data_list = []
-        for query in queryset:
-            author = Author.objects.get(id=query.author_id)
-            data = {
-                "content": query,
-                "author": author
-            }
-            data_list.append(data)
-        serialized = ContentSerializer(data_list, many=True)
-        for serialized_data in serialized.data:
-            # Calculating `Total Engagement`
-            # Calculating `Engagement Rate`
-            like_count = serialized_data.get("like_count", 0)
-            comment_count = serialized_data.get("comment_count", 0)
-            share_count = serialized_data.get("share_count", 0)
-            view_count = serialized_data.get("view_count", 0)
-            total_engagement = like_count + comment_count + share_count
-            if view_count > 0:
-                engagement_rate = total_engagement / view_count
-            else:
-                engagement_rate = 0
-            serialized_data["content"]["engagement_rate"] = engagement_rate
-            serialized_data["content"]["total_engagement"] = total_engagement
-            tags = list(
-                ContentTag.objects.filter(
-                    content_id=serialized_data["content"]["id"]
-                ).values_list("tag__name", flat=True)
+        queryset = Content.objects.select_related('author').prefetch_related(
+            'contenttag_set__tag'
+        ).annotate(
+            total_engagement=F('like_count') + F('comment_count') + F('share_count'),
+            engagement_rate=Cast(
+                (F('like_count') + F('comment_count') + F('share_count')) /
+                Case(
+                    When(view_count=0, then=1),
+                    default=F('view_count'),
+                    output_field=FloatField(),
+                ),
+                FloatField()
             )
-            serialized_data["content"]["tags"] = tags
-        return Response(serialized.data, status=status.HTTP_200_OK)
+        ).order_by('-id')
 
-    def post(self, request, ):
+        if author_id := request.query_params.get('author_id'):
+            queryset = queryset.filter(author_id=author_id)
+
+        if author_username := request.query_params.get('author_username'):
+            queryset = queryset.filter(author__username=author_username)
+
+        if timeframe := request.query_params.get('timeframe'):
+            try:
+                days = int(timeframe)
+                cutoff_date = timezone.now() - timedelta(days=days)
+                queryset = queryset.filter(timestamp__gte=cutoff_date)
+            except (ValueError, TypeError):
+                pass
+
+        if tag_id := request.query_params.get('tag_id'):
+            queryset = queryset.filter(contenttag__tag_id=tag_id)
+
+        if title := request.query_params.get('title'):
+            queryset = queryset.filter(title__icontains=title)
+
+        # Pagination implementation
+        try:
+            page = int(request.query_params.get('page', 1))
+            items_per_page = min(
+                int(request.query_params.get('items_per_page', self.DEFAULT_PAGE_SIZE)),
+                self.MAX_PAGE_SIZE
+            )
+        except ValueError:
+            page = 1
+            items_per_page = self.DEFAULT_PAGE_SIZE
+
+        paginator = Paginator(queryset, items_per_page)
+        page_obj = paginator.get_page(page)
+
+        serialized = ContentSerializer(
+            [
+                {'content': content, 'author': content.author}
+                for content in page_obj.object_list
+            ],
+            many=True
+        )
+
+        return Response({
+            'data': serialized.data,
+            'pagination': {
+                'current_page': page_obj.number,
+                'total_pages': paginator.num_pages,
+                'total_items': paginator.count,
+                'items_per_page': items_per_page,
+                'has_next': page_obj.has_next(),
+                'has_previous': page_obj.has_previous(),
+            }
+        }, status=status.HTTP_200_OK)
+
+    def post(self, request):
         """
         TODO: This api is very hard to read, and inefficient.
          The users complaining that the contents they are seeing is not being updated.
@@ -91,91 +133,85 @@ class ContentAPIView(APIView):
          2. Support list, make this api accept list of objects and save it
          3. Fix the users complain
         """
+        data = request.data if isinstance(request.data, list) else [request.data]
+        response_data = []
 
-        serializer = ContentPostSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        for content_data in data:
+            serializer = ContentPostSerializer(data=content_data)
+            serializer.is_valid(raise_exception=True)
+            validated_data = serializer.validated_data
 
-        author = serializer.validated_data.get("author")
-        hashtags = serializer.validated_data.get("hashtags")
-
-        try:
-            author_object = Author.objects.get(
-                unique_id=author["unique_external_id"]
-            )
-        except Author.DoesNotExist:
-            Author.objects.create(
-                username=author["unique_name"],
-                name=author["full_name"],
-                unique_id=author["unique_external_id"],
-                url=author["url"],
-                title=author["title"],
-                big_metadata=author["big_metadata"],
-                secret_value=author["secret_value"],
-            )
-            author_object = Author.objects.get(
-                unique_id=author["unique_external_id"]
-            )
-            print("Author: ", author_object)
-
-        content = serializer.validated_data
-
-        try:
-            content_object = Content.objects.get(
-                unique_id=content["unq_external_id"]
-            )
-        except Content.DoesNotExist:
-
-            Content.objects.create(
-                unique_id=content["unq_external_id"],
-                author=author_object,
-                title=content.get("title"),
-                big_metadata=content.get("big_metadata"),
-                secret_value=content.get("secret_value"),
-                thumbnail_url=content.get("thumbnail_view_url"),
-                like_count=content["stats"]["likes"],
-                comment_count=content["stats"]["comments"],
-                share_count=content["stats"]["shares"],
-                view_count=content["stats"]["views"],
-            )
-
-            content_object = Content.objects.get(
-                unique_id=content["unq_external_id"]
-            )
-            print("Content: ", content_object)
-
-        for tag in hashtags:
-            try:
-                tag_object = Tag.objects.get(name=tag)
-            except Tag.DoesNotExist:
-                Tag.objects.create(name=tag)
-                tag_object = Tag.objects.get(name=tag)
-                print("Tag Object: ", tag_object)
-
-            try:
-                content_tag_object = ContentTag.objects.get(
-                    tag=tag_object,
-                    content=content_object
-                )
-                print(content_tag_object)
-            except ContentTag.DoesNotExist:
-                ContentTag.objects.create(
-                    tag=tag_object,
-                    content=content_object
-                )
-                content_tag_object = ContentTag.objects.get(
-                    tag=tag_object,
-                    content=content_object
-                )
-                print("Content Object: ", content_tag_object)
-
-        return Response(
-            ContentSerializer(
-                {
-                    "content": content_object,
-                    "author": content_object.author,
+            # Get or create author
+            author_data = validated_data['author']
+            author_object, _ = Author.objects.update_or_create(
+                unique_id=author_data['unique_external_id'],
+                defaults={
+                    'username': author_data['unique_name'],
+                    'name': author_data['full_name'],
+                    'url': author_data['url'],
+                    'title': author_data['title'],
                 }
-            ).data,
-        )
+            )
+
+            # Get or create content with updated stats
+            content_object, _ = Content.objects.update_or_create(
+                unique_id=validated_data['unq_external_id'],
+                defaults={
+                    'author': author_object,
+                    'title': validated_data.get('title'),
+                    'thumbnail_url': validated_data.get('thumbnail_view_url'),
+                    'like_count': validated_data['stats']['likes'],
+                    'comment_count': validated_data['stats']['comments'],
+                    'share_count': validated_data['stats']['shares'],
+                    'view_count': validated_data['stats']['views'],
+                }
+            )
+
+            # Handle tags  with bulk operations
+            tags_to_create = []
+            content_tags_to_create = []
+            existing_tags = {
+                tag.name: tag
+                for tag in Tag.objects.filter(name__in=validated_data['hashtags'])
+            }
+
+            for tag_name in validated_data['hashtags']:
+                if tag_name not in existing_tags:
+                    tag = Tag(name=tag_name)
+                    tags_to_create.append(tag)
+                    existing_tags[tag_name] = tag
+
+            # Bulk create new tags
+            if tags_to_create:
+                Tag.objects.bulk_create(tags_to_create)
+
+            # Prepare content tags
+            existing_content_tags = set(
+                ContentTag.objects.filter(
+                    content=content_object
+                ).values_list('tag__name', flat=True)
+            )
+
+            for tag_name in validated_data['hashtags']:
+                if tag_name not in existing_content_tags:
+                    content_tags_to_create.append(
+                        ContentTag(
+                            tag=existing_tags[tag_name],
+                            content=content_object
+                        )
+                    )
+
+            # Bulk create new content tags
+            if content_tags_to_create:
+                ContentTag.objects.bulk_create(content_tags_to_create)
+
+            response_data.append({
+                'content': content_object,
+                'author': author_object,
+            })
+
+        serialized = ContentSerializer(response_data, many=True)
+        return Response(serialized.data, status=status.HTTP_201_CREATED)
 
 
 class ContentStatsAPIView(APIView):
@@ -205,30 +241,51 @@ class ContentStatsAPIView(APIView):
     """
     def get(self, request):
         query_params = request.query_params.dict()
-        tag = query_params.get('tag', None)
-        data = {
-            "total_likes": 0,
-            "total_shares": 0,
-            "total_views": 0,
-            "total_comments": 0,
-            "total_engagement": 0,
-            "total_engagement_rate": 0,
-            "total_contents": 0,
-            "total_followers": 0,
-        }
-        if tag:
-            queryset = Content.objects.filter(
-                contentag__tag__name=tag
-            )
-        else:
-            queryset = Content.objects.all()
-        for query in queryset:
-            data["total_likes"] += query.like_count
-            data["total_shares"] += query.share_count
-            data["total_comments"] += query.comment_count
-            data["total_views"] += query.view_count
-            data["total_engagement"] += data["total_likes"] + data["total_shares"] + data["total_comments"]
-            data["total_followers"] += query.author.followers
-            data["total_contents"] += 1
+        author_id = query_params.get('author_id')
+        author_username = query_params.get('author_username')
+        timeframe = query_params.get('timeframe')
+        tag_id = query_params.get('tag_id')
+        title = query_params.get('title')
 
-        return Response(data, status=status.HTTP_201_CREATED)
+        queryset = Content.objects.all()
+
+        if author_id:
+            queryset = queryset.filter(author_id=author_id)
+
+        if author_username:
+            queryset = queryset.filter(author__username=author_username)
+
+        if timeframe:
+            try:
+                days = int(timeframe)
+                cutoff_date = timezone.now() - timedelta(days=days)
+                queryset = queryset.filter(timestamp__gte=cutoff_date)
+            except (ValueError, TypeError):
+                logging.exception('Invalid timeframe value')
+                pass
+
+        if tag_id:
+            queryset = queryset.filter(contenttag__tag_id=tag_id)
+
+        if title:
+            queryset = queryset.filter(title__icontains=title)
+
+        stats = queryset.aggregate(
+            total_likes=Sum('like_count'),
+            total_shares=Sum('share_count'),
+            total_comments=Sum('comment_count'),
+            total_views=Sum('view_count'),
+            total_followers=Sum('author__followers'),
+            total_contents=Sum(1),
+            total_engagement=Sum(F('like_count') + F('share_count') + F('comment_count')),
+            total_engagement_rate=Sum(
+                (F('like_count') + F('share_count') + F('comment_count')) /
+                Case(
+                    When(view_count=0, then=1),
+                    default=F('view_count'),
+                    output_field=FloatField()
+                )
+            )
+        )
+
+        return Response(stats, status=status.HTTP_200_OK)
