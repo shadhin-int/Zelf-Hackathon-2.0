@@ -101,3 +101,9 @@ Then retry for another 2-3 times.
 
 4. Make an api ( Post Request ), that will trigger comment posting, make sure to add authentication middleware. 
 Only authenticated users can trigger comments posting
+
+
+## Instructions env setup and run
+```
+cp .env.example .env
+```
